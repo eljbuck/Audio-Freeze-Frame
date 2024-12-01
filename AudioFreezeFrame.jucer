@@ -1,9 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<JUCERPROJECT id="yEOmFP" name="AudioFreezeFrameNaive" projectType="guiapp"
-              useAppConfig="0" addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1"
-              defines="JUCE_MODAL_LOOPS_PERMITTED=1">
-  <MAINGROUP id="aYNRZK" name="AudioFreezeFrameNaive">
+<JUCERPROJECT id="yEOmFP" name="AudioFreezeFrame" projectType="guiapp" useAppConfig="0"
+              addUsingNamespaceToJuceHeader="0" jucerFormatVersion="1" defines="JUCE_MODAL_LOOPS_PERMITTED=1">
+  <MAINGROUP id="aYNRZK" name="AudioFreezeFrame">
     <GROUP id="{661485E5-DA5C-1191-84DC-AB2A670872E8}" name="Source">
       <FILE id="LtVzvp" name="Main.cpp" compile="1" resource="0" file="Source/Main.cpp"/>
       <FILE id="vEr9Gl" name="MainComponent.h" compile="0" resource="0" file="Source/MainComponent.h"/>

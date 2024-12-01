@@ -13,7 +13,7 @@ MainComponent::MainComponent()
       forecast(0),
       thawing(false),
       forecasting(false),
-      freezeDuration(3.0)
+      freezeDuration(0.2)
 {
     // Make sure you set the size of the component after
     // you add any child components.
