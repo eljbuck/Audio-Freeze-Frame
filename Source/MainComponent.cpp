@@ -12,8 +12,11 @@ MainComponent::MainComponent()
       currentBufferWriteIndex(0),
       forecast(0),
       thawing(false),
+      justThawed(false),
       forecasting(false),
-      freezeDuration(0.2)
+      freezeDuration(0.3),
+      samples(nullptr),
+      samplesBeforeFadeOut(0)
 {
     // Make sure you set the size of the component after
     // you add any child components.
@@ -49,7 +52,7 @@ MainComponent::MainComponent()
     freezeButton.setColour(juce::TextButton::buttonColourId, juce::Colours::lightblue);
     freezeButton.setEnabled(false);
     addAndMakeVisible(&freezeButton);
-    
+
     formatManager.registerBasicFormats();
 }
 
@@ -64,6 +67,10 @@ void MainComponent::prepareToPlay (int samplesPerBlockExpected, double sampleRat
 {
     circularBufferSize = static_cast<int>(freezeDuration * sampleRate);
     circularBuffer.setSize(2, circularBufferSize); // Stereo (2 channels)
+    samples = new float[circularBufferSize];
+    
+    // juce error: noramlisation param is inverted?
+    juce::dsp::WindowingFunction<float>::fillWindowingTables(samples, circularBufferSize, juce::dsp::WindowingFunction<float>::hann, false);
     circularBuffer.clear();
     currentBufferWriteIndex = 0;
     currentBufferReadIndex = 0;
@@ -114,11 +121,13 @@ void MainComponent::transportStateChanged(TransportState newState)
     TransportState oldState = state;
     state = newState;
     
+    // Update UI state
     switch (state) {
         case Unprimed:
             stopButton.setEnabled(false);
             playButton.setEnabled(false);
             freezeButton.setEnabled(false);
+            break;
         case Stopped:
             stopButton.setEnabled(false);
             playButton.setEnabled(true);
@@ -126,9 +135,7 @@ void MainComponent::transportStateChanged(TransportState newState)
             transport.setPosition(0);
             break;
         case Starting:
-            if (oldState == Freezing) {
-                thawing = true;
-            }
+            if (oldState == Freezing) thawing = true;
             stopButton.setEnabled(true);
             freezeButton.setEnabled(true);
             playButton.setEnabled(false);
@@ -145,8 +152,6 @@ void MainComponent::transportStateChanged(TransportState newState)
             playButton.setEnabled(true);
             freezeButton.setEnabled(false);
             forecasting = true;
-            // ensure freeze happens from start of circle buffer
-//            currentBufferReadIndex = (currentBufferWriteIndex + 1) % circularBufferSize;
             break;
     }
 }
@@ -157,21 +162,26 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
     int numSamples = bufferToFill.numSamples;
     
     if (thawing) {
-        int samplesLeft = getBufferDist(currentBufferReadIndex, currentBufferWriteIndex);
+        samplesBeforeFadeIn = getBufferDist(currentBufferReadIndex, currentBufferWriteIndex);
         
         // if we are on the last numSamples samples in our circle buffer
-        if (samplesLeft < numSamples) {
+        if (samplesBeforeFadeIn < numSamples) {
             // set the read pos in the file based on remaining samples in the circular buffer
             long long lastPos = transport.getNextReadPosition();
-            long long curPos = lastPos - samplesLeft;
+            long long curPos = lastPos - samplesBeforeFadeIn;
             transport.setNextReadPosition(curPos);
 
-            // set the new write pos to the circular bufer for the next time we read in more samples
-            currentBufferWriteIndex = getBufferPos(currentBufferWriteIndex, -samplesLeft);
+            // set the new write pos to the circular buffer for the next time we read in more samples
+            currentBufferWriteIndex = getBufferPos(currentBufferWriteIndex, -samplesBeforeFadeIn);
             
             thawing = false;
-
+            justThawed = true;
         }
+    }
+    
+    // if this is first iteration of forecasting
+    if (forecasting && forecast == 0) {
+        samplesBeforeFadeOut = (circularBufferSize / 2) % numSamples;
     }
     
     // read next numsamples from the circular buffer
@@ -182,10 +192,21 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
         {
             for (int sample = 0; sample < numSamples; ++sample)
             {
-                // read the sample value out of the circular buffer
+                // read the first sample value out of the circular buffer, multiply by window val
                 int readIndex = (currentBufferReadIndex + sample) % circularBufferSize;
-                float sampleValue = circularBuffer.getSample(channel, readIndex);
-                buffer->setSample(channel, sample, sampleValue);
+                int windowIdx = getBufferDist((currentBufferWriteIndex + 1) % circularBufferSize, readIndex);
+                float windowVal = samples[windowIdx];
+                float sampleValue = circularBuffer.getSample(channel, readIndex) * windowVal;
+                
+                // read the second sample value out of the circular buffer, multiply by window val
+                int secondReadIndex = (readIndex + circularBufferSize / 2) % circularBufferSize;
+                float secondWindowVal = 1.0 - windowVal;
+                float secondSampleValue = circularBuffer.getSample(channel, secondReadIndex) * secondWindowVal;
+                
+                buffer->setSample(channel, sample, sampleValue + secondSampleValue);
+                
+//                DBG("first window: " + std::to_string(windowVal));
+//                DBG("second window: " + std::to_string(secondWindowVal));
             }
         }
     
@@ -193,13 +214,7 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
     } 
     else // read next numsamples from the file into the buffer, write them to the circle buffer
     {
-        if (forecasting && forecast > circularBufferSize / 2) {
-            currentBufferReadIndex = (currentBufferWriteIndex + 1) % circularBufferSize;
-            forecasting = false;
-            forecast = 0;
-            return;
-        }
-        // read from file
+        // read from file, if no modifications are made later (i.e. forecasting or justThawed), sends audio to output buffer
         transport.getNextAudioBlock(bufferToFill);
 
         // write to circle buffer
@@ -207,12 +222,56 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
         {
             for (int sample = 0; sample < numSamples; ++sample)
             {
+                if (forecasting) {
+                    // fade out: multiply by the window, or 1 if we are before the window kicks in
+                    int fadeOutWindowIdx = circularBufferSize / 2 + forecast + sample - samplesBeforeFadeOut;
+                    float fadeOutWindowVal = (fadeOutWindowIdx >= circularBufferSize / 2) ? samples[fadeOutWindowIdx] : 1.0;
+                    float fadingOutSample = buffer->getSample(channel, sample) * fadeOutWindowVal;
+                    
+                    // fade in the first half of the buffer
+                    float fadeInWindowVal = 1.0 - fadeOutWindowVal;
+                    int fadeInSampleIdx = (currentBufferWriteIndex + 1 + circularBufferSize / 2 + sample) % circularBufferSize;
+                    float fadingInSample = circularBuffer.getSample(channel, fadeInSampleIdx) * fadeInWindowVal;
+                    
+                    buffer->setSample(channel, sample, fadingOutSample + fadingInSample);
+                }
+                
+                if (justThawed) {
+                    
+                    if (getBufferDist(currentBufferReadIndex, currentBufferWriteIndex) > circularBufferSize / 2)
+                    {
+                        justThawed = false;
+                    }
+                    
+                    int fadeOutSampleIdx = (currentBufferWriteIndex + circularBufferSize / 2 + sample) % circularBufferSize;
+                    int progressSinceThawing = getBufferDist(currentBufferReadIndex, currentBufferWriteIndex);
+                    int windowIdx = circularBufferSize / 2 - samplesBeforeFadeIn + progressSinceThawing;
+                    float windowVal = (windowIdx < circularBufferSize) ? samples[windowIdx] : 0.0;
+                    float fadeOutSampleVal = circularBuffer.getSample(channel, fadeOutSampleIdx) * windowVal;
+                    
+                    float sampleVal = buffer->getSample(channel, sample) * (1 - windowVal);
+                    
+                    buffer->setSample(channel, sample, fadeOutSampleVal + sampleVal);
+                }
+                
                 int writeIndex = (currentBufferWriteIndex + sample) % circularBufferSize;
                 circularBuffer.setSample(channel, writeIndex, buffer->getSample(channel, sample));
             }
         }
-        if (forecasting) forecast += numSamples;
+        
         currentBufferWriteIndex = (currentBufferWriteIndex + numSamples) % circularBufferSize;
+        
+        // inc count of forecasted samples and check if its time to freeze
+        if (forecasting) {
+            forecast += numSamples;
+            if (forecast > circularBufferSize / 2) {
+                // reset read idx to start of buffer, stop forecasting
+                currentBufferReadIndex = (currentBufferWriteIndex + 1) % circularBufferSize;
+                forecasting = false;
+                forecast = 0;
+                return;
+            }
+        }
     }
 }
 

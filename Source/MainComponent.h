@@ -2,6 +2,7 @@
 
 #include <JuceHeader.h>
 #include <deque>
+#include <juce_dsp/juce_dsp.h>
 
 //==============================================================================
 /*
@@ -59,8 +60,12 @@ private:
     int currentBufferWriteIndex;
     int forecast;
     bool thawing;
+    bool justThawed;
+    int samplesBeforeFadeIn;
     bool forecasting;
     double freezeDuration;
+    float *samples;
+    int samplesBeforeFadeOut;
     //==============================================================================
     // Your private member variables go here...
 
