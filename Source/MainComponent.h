@@ -55,6 +55,7 @@ private:
     juce::TextButton freezeButton;
     
     juce::AudioSampleBuffer circularBuffer;
+    juce::dsp::FFT fft;
     int circularBufferSize;
     int currentBufferReadIndex;
     int currentBufferWriteIndex;
@@ -63,7 +64,7 @@ private:
     bool justThawed;
     int samplesBeforeFadeIn;
     bool forecasting;
-    double freezeDuration;
+    int freezeSamples;
     float *samples;
     int samplesBeforeFadeOut;
     //==============================================================================

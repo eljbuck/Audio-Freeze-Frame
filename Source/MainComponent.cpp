@@ -1,4 +1,5 @@
 #include "MainComponent.h"
+#include <random> // For generating random phase
 
 //==============================================================================
 MainComponent::MainComponent() 
@@ -7,6 +8,7 @@ MainComponent::MainComponent()
       playButton("Play"),
       stopButton("Stop"),
       freezeButton("Freeze"),
+      fft(0),
       circularBufferSize(0),
       currentBufferReadIndex(0),
       currentBufferWriteIndex(0),
@@ -14,9 +16,10 @@ MainComponent::MainComponent()
       thawing(false),
       justThawed(false),
       forecasting(false),
-      freezeDuration(0.3),
+      freezeSamples(32768),
       samples(nullptr),
       samplesBeforeFadeOut(0)
+      
 {
     // Make sure you set the size of the component after
     // you add any child components.
@@ -65,9 +68,11 @@ MainComponent::~MainComponent()
 //==============================================================================
 void MainComponent::prepareToPlay (int samplesPerBlockExpected, double sampleRate)
 {
-    circularBufferSize = static_cast<int>(freezeDuration * sampleRate);
+    DBG("Preparing to play");
+    circularBufferSize = static_cast<int>(freezeSamples);
     circularBuffer.setSize(2, circularBufferSize); // Stereo (2 channels)
     samples = new float[circularBufferSize];
+    fft = juce::dsp::FFT(std::log2(circularBufferSize));
     
     // juce error: noramlisation param is inverted?
     juce::dsp::WindowingFunction<float>::fillWindowingTables(samples, circularBufferSize, juce::dsp::WindowingFunction<float>::hann, false);
@@ -80,7 +85,7 @@ void MainComponent::prepareToPlay (int samplesPerBlockExpected, double sampleRat
 void MainComponent::openButtonClicked()
 {
     // Choose a file
-    juce::FileChooser chooser ("Choose a wav or aiff file", juce::File::getSpecialLocation(juce::File::userDocumentsDirectory), "*.wav; *.aiff; *.mp3");
+    juce::FileChooser chooser ("Choose a wav or aiff file", juce::File::getSpecialLocation(juce::File::userDocumentsDirectory), "*.wav; *.aiff; *.mp3; *.m4a");
     // If the user chooses a file
     if (chooser.browseForFileToOpen()) {
         juce::File myFile = chooser.getResult();
@@ -204,15 +209,12 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
                 float secondSampleValue = circularBuffer.getSample(channel, secondReadIndex) * secondWindowVal;
                 
                 buffer->setSample(channel, sample, sampleValue + secondSampleValue);
-                
-//                DBG("first window: " + std::to_string(windowVal));
-//                DBG("second window: " + std::to_string(secondWindowVal));
             }
         }
     
         currentBufferReadIndex = (currentBufferReadIndex + numSamples) % circularBufferSize;
     } 
-    else // read next numsamples from the file into the buffer, write them to the circle buffer
+    else // read next numsamples from the file into the output buffer, write them to the circle buffer
     {
         // read from file, if no modifications are made later (i.e. forecasting or justThawed), sends audio to output buffer
         transport.getNextAudioBlock(bufferToFill);
@@ -228,7 +230,7 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
                     float fadeOutWindowVal = (fadeOutWindowIdx >= circularBufferSize / 2) ? samples[fadeOutWindowIdx] : 1.0;
                     float fadingOutSample = buffer->getSample(channel, sample) * fadeOutWindowVal;
                     
-                    // fade in the first half of the buffer
+                    // fade in the first half of the circle buffer
                     float fadeInWindowVal = 1.0 - fadeOutWindowVal;
                     int fadeInSampleIdx = (currentBufferWriteIndex + 1 + circularBufferSize / 2 + sample) % circularBufferSize;
                     float fadingInSample = circularBuffer.getSample(channel, fadeInSampleIdx) * fadeInWindowVal;
@@ -243,12 +245,14 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
                         justThawed = false;
                     }
                     
+                    // fade out the last half of the circle buffer
                     int fadeOutSampleIdx = (currentBufferWriteIndex + circularBufferSize / 2 + sample) % circularBufferSize;
                     int progressSinceThawing = getBufferDist(currentBufferReadIndex, currentBufferWriteIndex);
                     int windowIdx = circularBufferSize / 2 - samplesBeforeFadeIn + progressSinceThawing;
                     float windowVal = (windowIdx < circularBufferSize) ? samples[windowIdx] : 0.0;
                     float fadeOutSampleVal = circularBuffer.getSample(channel, fadeOutSampleIdx) * windowVal;
                     
+                    // fade in the next samples from the file
                     float sampleVal = buffer->getSample(channel, sample) * (1 - windowVal);
                     
                     buffer->setSample(channel, sample, fadeOutSampleVal + sampleVal);
@@ -264,7 +268,58 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
         // inc count of forecasted samples and check if its time to freeze
         if (forecasting) {
             forecast += numSamples;
-            if (forecast > circularBufferSize / 2) {
+            if (forecast >= circularBufferSize / 2) {
+                
+                for (int channel = 0; channel < buffer->getNumChannels(); ++channel) {
+                    std::vector<float> fftBuffer(circularBufferSize * 2, 0.0f);
+
+                    // Step 1: Unwrap the circular buffer
+                    for (int i = 0; i < circularBufferSize; ++i)
+                    {
+                        int index = (currentBufferReadIndex + i) % circularBufferSize;
+                        fftBuffer[i] = circularBuffer.getSample(channel, index);
+                    }
+
+                    // Step 2: Perform the forward FFT
+                    fft.performRealOnlyForwardTransform(fftBuffer.data());
+
+                    // Step 3: Randomize the phase
+                    std::random_device rd;
+                    std::mt19937 gen(rd());
+                    std::uniform_real_distribution<float> dist(0.0f, 2.0f * juce::MathConstants<float>::pi);
+
+                    for (int i = 1; i < circularBufferSize / 2; ++i) // Skip DC and Nyquist frequencies
+                    {
+                        // Access real and imaginary parts (interleaved)
+                        float realPart = fftBuffer[2 * i];
+                        float imagPart = fftBuffer[2 * i + 1];
+                        
+                        // Compute magnitude
+                        float magnitude = std::sqrt(realPart * realPart + imagPart * imagPart);
+                        
+                        // Generate a random phase
+                        float randomPhase = dist(gen);
+                        
+                        // Update real and imaginary parts with randomized phase
+                        fftBuffer[2 * i] = magnitude * std::cos(randomPhase);
+                        fftBuffer[2 * i + 1] = magnitude * std::sin(randomPhase);
+                    }
+
+                    // Ensure symmetry for a real signal
+                    fftBuffer[1] = 0.0f; // Imaginary part of DC component
+                    fftBuffer[2 * (circularBufferSize / 2) + 1] = 0.0f; // Imaginary part of Nyquist frequency
+
+                    // Step 4: Perform the inverse FFT
+                    fft.performRealOnlyInverseTransform(fftBuffer.data());
+
+                    // Step 5: Normalize and rewrap the data back into the circular buffer
+                    for (int i = 0; i < circularBufferSize; ++i)
+                    {
+                        int index = (currentBufferReadIndex + i) % circularBufferSize;
+                        circularBuffer.setSample(channel, index, fftBuffer[i]);
+                    }
+                }
+                
                 // reset read idx to start of buffer, stop forecasting
                 currentBufferReadIndex = (currentBufferWriteIndex + 1) % circularBufferSize;
                 forecasting = false;
@@ -274,8 +329,6 @@ void MainComponent::getNextAudioBlock (const juce::AudioSourceChannelInfo& buffe
         }
     }
 }
-
-
 
 // return the positive index at an arbitrary positive or negative offset
 // from an arbitrary start index
